@@ -1,26 +1,13 @@
 // ==UserScript==
 // @name         myAIE Auto Grades (Courses page)
 // @namespace    http://tampermonkey.net/
-// @version      11.0
+// @version      11.5
 // @description  Replaces the course cards with results cards: marks, weightings, today's classes (with Join), custom order, PDFs and settings
 // @match        https://student.myaie.ac/*
 // @run-at       document-start
 // @require      https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js
 // @grant        none
 // ==/UserScript==
-<!-- graphify-rules-start (managed by `graphify init`) -->
-## Use Graphify before grep
-
-This repository is indexed by Graphify: a code graph over its call, dependency, and test structure, exposed through a connected Graphify MCP server. Before reaching for grep or reading files, use the Graphify tools your MCP client lists (their exact names and descriptions are in the server's tool list) for what the graph knows and a text search does not:
-
-- find where a symbol, function, or class is defined (instead of grepping for it)
-- understand how something works, or where a behavior is handled
-- find who calls a function, or what it calls
-- see what a change affects (its blast radius) and which tests cover it
-- map a file's dependencies and dependents
-
-Fall back to grep or file reads only for what the graph does not model: literal string or comment matches, non-indexed files, or reading a file you have already located. If no Graphify tools are listed, check the MCP server connection.
-<!-- graphify-rules-end -->
 (function () {
     'use strict';
 
@@ -31,27 +18,27 @@ Fall back to grep or file reads only for what the graph does not model: literal 
     const GRADES_API = API_BASE + 'getSubjectAssignments?sid=';
     const SCHEDULE_API = API_BASE + 'getSubjectEventPageWiseTz';
     const JOIN_API = API_BASE + 'joinBBBClass?id=';
-    const JSPDF_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js';   // keep in sync with @require
+    const JSPDF_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js'; // keep in sync with @require
 
-    const EXCLUDE = [];             // course ids to hide from the dashboard
-    const PASS_MARK = 50;           // overall % needed to pass a course
-    const GRADES_TTL_MS = 5 * 60 * 1000;        // how often a course's marks are refetched
-    const SCHEDULE_TTL_MS = 30 * 1000;          // schedule refetch while a class is on today or starts within 2 hours (keeps Join accurate)
+    const EXCLUDE = []; // course ids to hide from the dashboard
+    const PASS_MARK = 50; // overall % needed to pass a course
+    const GRADES_TTL_MS = 5 * 60 * 1000; // how often a course's marks are refetched
+    const SCHEDULE_TTL_MS = 30 * 1000; // schedule refetch while a class is on today or starts within 2 hours (keeps Join accurate)
     const SCHEDULE_IDLE_TTL_MS = 10 * 60 * 1000; // schedule refetch the rest of the time
-    const LOOKAHEAD_DAYS = 14;      // how far ahead to look for the next class
-    const SWAP_MS = 280;            // how long a card slides aside while dragging (higher = slower)
-    const MAX_PAGES = 10;           // safety limit when paging through the schedule
-    const DEBUG = false;            // log extra details to the console
+    const LOOKAHEAD_DAYS = 14; // how far ahead to look for the next class
+    const SWAP_MS = 280; // how long a card slides aside while dragging (higher = slower)
+    const MAX_PAGES = 10; // safety limit when paging through the schedule
+    const DEBUG = false; // log extra details to the console
 
     const KEYS = { grades: 'myAIE_grades_cache_v9', weights: 'myAIE_weights_v2', order: 'myAIE_order_v1', settings: 'myAIE_settings_v1', courses: 'myAIE_courses_v1', sort: 'myAIE_sort_v1' };
     const DEFAULT_SETTINGS = {
-        showPercent: true,          // marks, averages and the weighted line
-        showWeights: true,          // the (15%) next to each assessment
-        showProgress: true,         // the original card's progress bar
-        showToday: true,            // the box with today's classes and the next class
-        showUpNext: true,           // the UP NEXT banner and highlight
-        hiddenCourses: [],          // course ids hidden from the dashboard
-        weights: {}                 // your own weightings: { courseId: { assessmentId: % } }
+        showPercent: true, // marks, averages and the weighted line
+        showWeights: true, // the (15%) next to each assessment
+        showProgress: true, // the original card's progress bar
+        showToday: true, // the box with today's classes and the next class
+        showUpNext: true, // the UP NEXT banner and highlight
+        hiddenCourses: [], // course ids hidden from the dashboard
+        weights: {} // your own weightings: { courseId: { assessmentId: % } }
     };
     const SORT_MODES = [
         ['custom', 'My order (drag to arrange)'],
@@ -74,21 +61,21 @@ Fall back to grep or file reads only for what the graph does not model: literal 
     /* =====================================================================
      * STATE
      * ===================================================================== */
-    let TOKEN = null;               // login token, kept in memory only and never saved
-    let WEIGHTS = readJSON(KEYS.weights, {});   // sid -> { at, ttl, map: { assessmentId: weight% } }
+    let TOKEN = null; // login token, kept in memory only and never saved
+    let WEIGHTS = readJSON(KEYS.weights, {}); // sid -> { at, ttl, map: { assessmentId: weight% } }
     let SETTINGS = normalizeSettings(readJSON(KEYS.settings, {}));
-    let SORT = sanitizeSort(readJSON(KEYS.sort, 'custom'));   // how the course cards are ordered
-    const schedule = {};            // sid -> { items: today's classes + assessments, next: next class }
-    const fetchedAt = { grades: {}, schedule: {} };   // kind -> sid -> time of last fetch
-    const headerHeights = {};       // sid -> height of the original card header (only measurable while the originals are visible)
-    const emptySids = new Set();    // courses the API says have no assessments
+    let SORT = sanitizeSort(readJSON(KEYS.sort, 'custom')); // how the course cards are ordered
+    const schedule = {}; // sid -> { items: today's classes + assessments, next: next class }
+    const fetchedAt = { grades: {}, schedule: {} }; // kind -> sid -> time of last fetch
+    const headerHeights = {}; // sid -> height of the original card header (only measurable while the originals are visible)
+    const emptySids = new Set(); // courses the API says have no assessments
 
-    let running = false;            // a refresh is in progress
+    let running = false; // a refresh is in progress
     let statusText = '';
-    let renderedSig = '';           // which cards the current render was built from
-    let lastGridKey = '', lastHeaderKey = '';   // what is on screen, so unchanged parts are left alone
+    let renderedSig = ''; // which cards the current render was built from
+    let lastGridKey = '', lastHeaderKey = ''; // what is on screen, so unchanged parts are left alone
     let dragging = false;
-    let swapUntil = 0;              // drag swaps are paused until this time so the slide can finish
+    let swapUntil = 0; // drag swaps are paused until this time so the slide can finish
     let retryTimer = null, renderTimer = null, modalKeyHandler = null;
 
     /* =====================================================================
@@ -122,12 +109,13 @@ Fall back to grep or file reads only for what the graph does not model: literal 
     const r1 = n => Math.round(n * 10) / 10;
     const pad2 = n => String(n).padStart(2, '0');
     const dateKey = d => d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+    const fmtPct = (v, empty = 'N/A') => v === null || v === undefined ? empty : r1(v) + '%';
     const mean = arr => arr.reduce((a, b) => a + b, 0) / arr.length;
     const fmtAvg = (marks, empty = 'N/A') => marks.length ? r1(mean(marks)) + '%' : empty;
     const shortName = n => String(n).replace(/^.*?\s+-\s+/, '').trim() || String(n);
-    const isScored = r => r.graded && r.pct !== null;                // has a score
-    const isFuture = r => r.opens > Date.now() / 1000;               // hasn't taken place yet
-    const isMarked = r => isScored(r) && !isFuture(r);               // counts toward averages
+    const isScored = r => r.graded && r.pct !== null; // has a score
+    const isFuture = r => r.opens > Date.now() / 1000; // hasn't taken place yet
+    const isMarked = r => isScored(r) && !isFuture(r); // counts toward averages
 
     const loadGrades = () => readJSON(KEYS.grades, {});
     const loadOrder = () => readJSON(KEYS.order, []);
@@ -179,7 +167,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
             if (/myaie\.ac/.test(url)) { grabAuth(init && init.headers); if (input && input.headers) grabAuth(input.headers); }
         } catch (e) {}
         const p = origFetch.apply(this, arguments);
-        if (isGradesUrl(url)) {                                      // only the grades responses are worth reading
+        if (isGradesUrl(url)) { // only the grades responses are worth reading
             p.then(res => {
                 try { res.clone().json().then(j => { if (storeGrades(j, sidFromUrl(url))) renderSoon(); }).catch(() => {}); } catch (e) {}
             }).catch(() => {});
@@ -224,7 +212,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
         const entry = { code: first.code || String(first.courseId), courseName: first.course_name || '', rows: {} };
         list.forEach(a => {
             const sc = (a.studentCourses && a.studentCourses[0]) || {};
-            const graded = sc.mark !== null && sc.mark !== undefined;   // an unmarked assessment reports "0%", so check mark
+            const graded = sc.mark !== null && sc.mark !== undefined; // an unmarked assessment reports "0%", so check mark
             const total = parseFloat(sc.ass_total_mark ?? a.subAssTotMark);
             const got = parseFloat(sc.subAssObtainMark);
             const pct = graded ? parseFloat(sc.subAssObtainPercentage) : null;
@@ -355,7 +343,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
     }
 
     async function joinClass(classId, btn) {
-        const win = window.open('about:blank', '_blank');       // opened straight away so the popup isn't blocked
+        const win = window.open('about:blank', '_blank'); // opened straight away so the popup isn't blocked
         const label = btn.textContent;
         btn.disabled = true; btn.textContent = 'Joining...';
         try {
@@ -379,7 +367,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
     function courseStats(sid, d) {
         const rows = Object.values(d.rows);
         const marks = rows.filter(isMarked).map(r => r.pct);
-        const map = { ...((WEIGHTS[sid] && WEIGHTS[sid].map) || {}), ...(SETTINGS.weights[sid] || {}) };   // your overrides win
+        const map = { ...((WEIGHTS[sid] && WEIGHTS[sid].map) || {}), ...(SETTINGS.weights[sid] || {}) }; // your overrides win
         const weightOf = r => (r.id !== undefined && map[r.id] !== undefined) ? map[r.id] : null;
 
         let totalW = 0, markedW = 0, earned = 0, missing = 0;
@@ -391,10 +379,11 @@ Fall back to grep or file reads only for what the graph does not model: literal 
         });
 
         const weighted = [];
+        const weightedAvg = markedW > 0 ? earned / markedW * 100 : null; // average of the marked work, counted by weighting
         if (markedW > 0) {
             weighted.push(`Weighted: ${r1(earned)} of ${r1(markedW)} marked (${r1(earned / markedW * 100)}%)`);
             const remaining = totalW - markedW;
-            if (!missing && totalW > 99 && totalW < 101 && remaining > 0.5) {     // only when the weights add up to 100%
+            if (!missing && totalW > 99 && totalW < 101 && remaining > 0.5) { // only when the weights add up to 100%
                 const need = (PASS_MARK - earned) / remaining * 100;
                 weighted.push(need <= 0 ? `${PASS_MARK}% already secured`
                     : need > 100 ? `${PASS_MARK}% out of reach (would need ${r1(need)}%)`
@@ -402,7 +391,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
             } else if (missing) weighted.push(`weights missing for ${missing}`);
         } else if (totalW > 0) weighted.push(marks.length && missing ? `weights missing for ${missing}` : 'Nothing weighted is marked yet');
 
-        return { rows, marks, weightOf, weighted };
+        return { rows, marks, weightOf, weighted, weightedAvg };
     }
 
     /* =====================================================================
@@ -433,7 +422,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
 
     function saveOrder(grid) {
         const sids = [...grid.children].map(c => +c.dataset.sid).filter(Boolean);
-        const hidden = loadOrder().filter(s => !sids.includes(s));      // keep ids that are currently filtered out
+        const hidden = loadOrder().filter(s => !sids.includes(s)); // keep ids that are currently filtered out
         writeJSON(KEYS.order, [...sids, ...hidden]);
         syncSidebar();
     }
@@ -450,7 +439,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
             .filter(a => isCourseLink(a) && !a.closest('#myAIE-results') && !a.closest('.moduleCardContainer'));
         const courseLinksIn = el => [...el.querySelectorAll('a[href*="/subject/"]')].filter(isCourseLink);
 
-        const groups = new Map();                                   // parent element -> its list items
+        const groups = new Map(); // parent element -> its list items
         links.forEach(a => {
             let item = a;
             while (item.parentElement && courseLinksIn(item.parentElement).length === 1) item = item.parentElement;
@@ -465,7 +454,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
             if (items.length < 2) return;
             const sorted = [...items].sort((x, y) => orderIdx(order, sidOf(x)) - orderIdx(order, sidOf(y)));
             if (sorted.every((el, i) => el === items[i])) return;
-            const markers = items.map(el => { const m = document.createComment(''); el.before(m); return m; });   // keep each slot
+            const markers = items.map(el => { const m = document.createComment(''); el.before(m); return m; }); // keep each slot
             sorted.forEach((el, i) => markers[i].after(el));
             markers.forEach(m => m.remove());
         });
@@ -583,7 +572,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
     /* =====================================================================
      * PDF: subject picker popup + unofficial summary (one page per course)
      * ===================================================================== */
-    const PDF = { L: 15, R: 195, X1: 110, X2: 135, X3: 160, LINE: [210, 214, 220] };   // page margins and table column dividers (mm)
+    const PDF = { L: 15, R: 195, X1: 110, X2: 135, X3: 160, LINE: [210, 214, 220] }; // page margins and table column dividers (mm)
     const cleanText = s => String(s || '').replace(/\s+/g, ' ').trim();
     // jsPDF's built-in fonts only cover Latin-1: swap common punctuation for plain characters and replace the rest
     const pdfText = s => cleanText(s).replace(/[\u2010-\u2015\u2212]/g, '-').replace(/[\u2018\u2019\u201A]/g, "'").replace(/[\u201C\u201D\u201E]/g, '"')
@@ -643,13 +632,13 @@ Fall back to grep or file reads only for what the graph does not model: literal 
         const rowsHtml = sids.map((s, i) => {
             const d = data[s];
             const code = d.code || cleanText(d.courseName);
-            const avg = fmtAvg(courseStats(s, d).marks, '-');
+            const st = courseStats(s, d), avg = fmtAvg(st.marks, '-'), wavg = fmtPct(st.weightedAvg, '-');
             return `<label style="display:flex;width:100%;min-height:52px;margin:0;align-items:stretch;cursor:pointer;background:#fff;${i < sids.length - 1 ? 'border-bottom:1px solid ' + border + ';' : ''}">
                 <span style="${cell};padding:12px 0 12px 24px">
                     <input type="checkbox" data-sid="${esc(s)}" checked style="${checkbox}">
                     <span style="color:${rgb(P.blue)};font-size:14px;font-weight:700">${esc(code)}</span>
                 </span>
-                <span style="${avgCell}font-size:14px;color:${rgb(P.text)}">${esc(avg)}</span></label>`;
+                <span class="myaie-avg" data-u="${esc(avg)}" data-w="${esc(wavg)}" style="${avgCell}font-size:14px;color:${rgb(P.text)}">${esc(avg)}</span></label>`;
         }).join('');
 
         const modal = showModal({
@@ -660,10 +649,14 @@ Fall back to grep or file reads only for what the graph does not model: literal 
                             <input type="checkbox" id="myAIE-pick-all" style="${checkbox}">
                             <span>Course</span>
                         </span>
-                        <span style="${avgCell}">Average</span>
+                        <span id="myAIE-avg-head" style="${avgCell}">Average</span>
                     </label>
                     <div style="max-height:46vh;overflow-y:auto">${rowsHtml}</div>
                 </div>
+                <label style="display:flex;align-items:flex-start;gap:10px;margin:16px 0 0;cursor:pointer;font-size:14px;color:${rgb(P.text)}">
+                    <input type="checkbox" id="myAIE-final" style="${checkbox};margin-top:3px">
+                    <span><b>Your Final Mark</b><br><small style="color:${rgb(P.grey)}">One page with just the weighted average of each selected course</small></span>
+                </label>
                 <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:20px">
                     <button type="button" class="btn btn-secondary" data-cancel="1">Cancel</button>
                     <button type="button" class="btn btn-primary" data-go="1">Download${dlIcon}</button>
@@ -673,6 +666,11 @@ Fall back to grep or file reads only for what the graph does not model: literal 
         const boxes = () => [...modal.querySelectorAll('input[data-sid]')];
         const allBox = modal.querySelector('#myAIE-pick-all');
         const goBtn = modal.querySelector('[data-go]');
+        const finalBox = modal.querySelector('#myAIE-final');
+        finalBox.addEventListener('change', () => { // the Average column follows the option
+            modal.querySelector('#myAIE-avg-head').textContent = finalBox.checked ? 'Weighted' : 'Average';
+            modal.querySelectorAll('.myaie-avg').forEach(el => { el.textContent = finalBox.checked ? el.dataset.w : el.dataset.u; });
+        });
         const sync = () => {
             const all = boxes(), n = all.filter(b => b.checked).length;
             goBtn.disabled = !n;
@@ -683,9 +681,9 @@ Fall back to grep or file reads only for what the graph does not model: literal 
         allBox.addEventListener('change', () => { boxes().forEach(b => { b.checked = allBox.checked; }); sync(); });
         boxes().forEach(b => b.addEventListener('change', sync));
         goBtn.onclick = () => {
-            const picked = boxes().filter(b => b.checked).map(b => +b.dataset.sid);
+            const picked = boxes().filter(b => b.checked).map(b => +b.dataset.sid), finalMark = finalBox.checked;
             closeModal();
-            if (picked.length) downloadPdf(picked);
+            if (picked.length) (finalMark ? downloadFinalMarkPdf : downloadPdf)(picked);
         };
         sync();
     }
@@ -764,8 +762,6 @@ Fall back to grep or file reads only for what the graph does not model: literal 
         doc.text('Results Summary', L, 28);
         font('normal', 13, P.navy);
         doc.text(pdfText(d.courseName || code), L, 36);
-        font('normal', 8.5, P.grey);
-        doc.text(doc.splitTextToSize('Unofficial summary generated from your myAIE results by a personal script. It is not a Statement of Results.', W), L, 42);
 
         // Info box
         doc.setFillColor(246, 246, 250);
@@ -839,13 +835,78 @@ Fall back to grep or file reads only for what the graph does not model: literal 
     }
 
     /* =====================================================================
+     * YOUR FINAL MARK PDF: one page, just the weighted average of each course
+     * ===================================================================== */
+    function buildFinalMarkPdf(lib, selected) {
+        const data = loadGrades();
+        const sids = ((selected && selected.length) ? selected : gridSids()).filter(s => hasRows(data[s]));
+        if (!sids.length) { alert('No results are loaded yet.'); return; }
+
+        const doc = new lib({ unit: 'mm', format: 'a4' });
+        const { font, keyValue } = pdfTools(doc);
+        const { L, R, LINE } = PDF, W = R - L;
+        const XM = 105; // column divider: course | weighted average
+
+        font('bold', 20, P.navy);
+        doc.text('Your Final Mark', L, 28);
+        font('normal', 13, P.navy);
+        doc.text(sids.length + (sids.length === 1 ? ' course' : ' courses'), L, 36);
+
+        doc.setFillColor(246, 246, 250);
+        doc.roundedRect(L, 50, W, 14, 3, 3, 'F');
+        keyValue('Date generated:', issuedDate(), L + 6, 59);
+
+        // Rows share the space left on the page, so any number of courses stays on one page
+        const top = 72, headH = 11, bottom = 268;
+        const rowH = Math.max(8, Math.min(16, (bottom - top - headH - 8) / sids.length));
+        const tableH = headH + rowH * sids.length;
+        const mid = (a, b) => (a + b) / 2;
+
+        doc.setDrawColor(...LINE); doc.setLineWidth(0.25);
+        doc.roundedRect(L, top, W, tableH, 2, 2, 'S');
+        doc.line(XM, top, XM, top + tableH);
+        font('bold', 10, [0, 0, 0]);
+        doc.text('Course', mid(L, XM), top + 7, { align: 'center' });
+        doc.text('Weighted average', mid(XM, R), top + 7, { align: 'center' });
+        doc.line(L, top + headH, R, top + headH);
+
+        let y = top + headH;
+        sids.forEach((sid, i) => {
+            const d = data[sid], avg = courseStats(sid, d).weightedAvg, cy = y + rowH / 2;
+            font('bold', 10, P.navy);
+            doc.text(pdfText(d.code) || '-', mid(L, XM), cy + 1.2, { align: 'center' });
+            font('bold', 13, avg === null ? P.grey : avg >= PASS_MARK ? P.green : P.red);
+            doc.text(fmtPct(avg), mid(XM, R), cy + 1.8, { align: 'center' });
+            y += rowH;
+            if (i < sids.length - 1) { doc.setDrawColor(...LINE); doc.line(L, y, R, y); }
+        });
+
+        pdfFooter(doc, '1/1');
+        doc.save('myAIE-final-mark-' + dateKey(new Date()) + '.pdf');
+    }
+
+    async function downloadFinalMarkPdf(selected) {
+        const btn = document.getElementById('myAIE-pdf');
+        const label = btn ? btn.innerHTML : '';
+        if (btn) { btn.textContent = 'Creating PDF...'; btn.disabled = true; }
+        try {
+            buildFinalMarkPdf(await loadJsPdf(), selected);
+        } catch (e) {
+            console.error('[myAIE] Final mark PDF failed', e);
+            alert('PDF failed: ' + (e && e.message ? e.message : e));
+        }
+        const after = document.getElementById('myAIE-pdf');
+        if (after) { after.innerHTML = label || 'Summary'; after.disabled = false; }
+    }
+
+    /* =====================================================================
      * EXAM DATES PDF
      * ===================================================================== */
     const isExam = it => it.category === 'task' && (/exam/i.test(it.ass_type || '') || /exam/i.test(it.name || ''));
 
     // A fresh lookup of every upcoming exam across the given courses
     async function collectExams(sids) {
-        const found = new Map();                                    // assessment id -> exam
+        const found = new Map(); // assessment id -> exam
         const nowSec = Date.now() / 1000;
         const today = new Date(); today.setHours(0, 0, 0, 0);
         await Promise.all(sids.map(async sid => {
@@ -859,7 +920,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
                     if (seen.has(key)) return;
                     seen.add(key); added++;
                     if (!isExam(it) || !it.open_date_time || !(it.close_date_time > nowSec)) return;
-                    const own = (SETTINGS.weights[sid] || {})[it.assessment_id];     // your own weighting wins
+                    const own = (SETTINGS.weights[sid] || {})[it.assessment_id]; // your own weighting wins
                     found.set(it.assessment_id, {
                         name: pdfText(it.name), code: pdfText(it.code), course: pdfText(it.subjectName), type: pdfText(it.ass_type) || 'Exam',
                         opens: it.open_date_time, closes: it.close_date_time, from: it.class_from, to: it.class_to,
@@ -889,7 +950,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
 
     function buildExamPdf(lib, exams) {
         const { L, R, LINE } = PDF, W = R - L;
-        const X1 = 70, X2 = 120, HEAD_H = 11, BOTTOM = 275;       // column dividers, header row height, last usable y (mm)
+        const X1 = 70, X2 = 120, HEAD_H = 11, BOTTOM = 275; // column dividers, header row height, last usable y (mm)
         const doc = new lib({ unit: 'mm', format: 'a4' });
         const { font, keyValue } = pdfTools(doc);
         const courses = new Set(exams.map(e => e.code || e.course));
@@ -990,7 +1051,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
     function applySettings(next) {
         SETTINGS = normalizeSettings(next);
         writeJSON(KEYS.settings, SETTINGS);
-        render();                                                    // does nothing unless the courses page is open
+        render(); // does nothing unless the courses page is open
     }
 
     // The settings page has no course cards, so the course list is remembered from the courses page
@@ -1042,6 +1103,8 @@ Fall back to grep or file reads only for what the graph does not model: literal 
             <div class="form-item"><div class="item-label">Weightings</div>${weights}</div>`;
     }
 
+    const sortSelect = () => `<select class="form-control selectcontrol" id="myAIE-sort" style="min-width:220px">${SORT_MODES.map(([key, label]) => `<option value="${esc(key)}"${key === SORT ? ' selected' : ''}>${esc(label)}</option>`).join('')}</select>`;
+
     function settingsFormHtml(draft, courses, data, wrapClass, saveClass) {
         const display = TOGGLES.map(([key, label, hint]) => settingRow(esc(label), esc(hint), showHideSelect('data-toggle', key, draft[key]))).join('');
         const modules = courses.length
@@ -1051,6 +1114,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
         return `<div class="settings-title" style="margin-top:32px">Course dashboard</div>
             <form id="myAIE-settings-form"><div class="${esc(wrapClass)}">
                 <div class="form-item"><div class="item-label">Display</div>${display}</div>
+                <div class="form-item"><div class="item-label">Course order</div>${settingRow('Sort courses', 'Dragging a card on the dashboard switches this back to My order', sortSelect())}</div>
                 <div class="form-item"><div class="item-label">Module</div>${modules}</div>
                 <div id="myAIE-mbox"></div>
                 <div class="form-item"><div class="item-label">Reset</div>${settingRow('Restore defaults', 'Clears every dashboard setting, hidden module and your own weightings', '<a href="#" data-reset="1">Reset all</a>')}</div>
@@ -1067,16 +1131,18 @@ Fall back to grep or file reads only for what the graph does not model: literal 
         const card = document.querySelector('.settings-card');
         if (!card || document.getElementById('myAIE-settings')) return;
 
-        const siteWrap = card.querySelector('form > div');               // copy the site's own (generated) class names
+        const siteWrap = card.querySelector('form > div'); // copy the site's own (generated) class names
         const siteSave = card.querySelector('.save-setting button');
         const data = loadGrades();
-        const draft = JSON.parse(JSON.stringify(SETTINGS));              // edited freely, only applied on Save
+        const draft = JSON.parse(JSON.stringify(SETTINGS)); // edited freely, only applied on Save
+        let sortDraft = null; // the chosen course order, applied on Save too
 
         const section = document.createElement('div');
         section.id = 'myAIE-settings';
         section.innerHTML = settingsFormHtml(draft, knownCourses(), data, (siteWrap && siteWrap.className) || '', (siteSave && siteSave.className) || 'btn btn-primary');
         card.appendChild(section);
 
+        section.querySelector('#myAIE-sort').addEventListener('change', e => { sortDraft = e.target.value; });
         section.querySelectorAll('select[data-toggle]').forEach(el => el.addEventListener('change', () => { draft[el.dataset.toggle] = el.value === '1'; }));
 
         // The module menu: shows the editor for the chosen module. Edits to every module are kept in `draft` until Save.
@@ -1103,17 +1169,19 @@ Fall back to grep or file reads only for what the graph does not model: literal 
 
         section.querySelector('form').addEventListener('submit', e => {
             e.preventDefault();
-            e.stopPropagation();                                         // the site's own form handler must not see this
+            e.stopPropagation(); // the site's own form handler must not see this
             Object.keys(draft.weights).forEach(k => { if (!Object.keys(draft.weights[k]).length) delete draft.weights[k]; });
             applySettings(draft);
+            if (sortDraft !== null) setSort(sortDraft);
             const note = section.querySelector('#myAIE-saved');
             note.textContent = 'Saved';
             setTimeout(() => { note.textContent = ''; }, 2500);
         });
         section.querySelector('[data-reset]').onclick = e => {
             e.preventDefault();
-            if (!confirm('Reset all dashboard settings (display options, hidden modules and your own weightings) to the defaults?')) return;
+            if (!confirm('Reset all dashboard settings (display options, course order, hidden modules and your own weightings) to the defaults?')) return;
             applySettings({});
+            setSort('custom');
             section.remove();
             injectSettingsPage();
         };
@@ -1158,7 +1226,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
         swapUntil = Date.now() + SWAP_MS + 40;
 
         kids.forEach(k => {
-            if (k === dragEl) return;                                // the card in your hand follows the cursor
+            if (k === dragEl) return; // the card in your hand follows the cursor
             const was = before.get(k), now = k.getBoundingClientRect();
             const dx = was.left - now.left, dy = was.top - now.top;
             if (!dx && !dy) return;
@@ -1177,7 +1245,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
             dragging = true;
             card.__drag = true;
             try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', String(sid)); } catch (err) {}
-            setTimeout(() => {                                       // after the drag image is captured
+            setTimeout(() => { // after the drag image is captured
                 card.style.opacity = '0.4';
                 card.classList.add('myaie-dragged');
                 grid.classList.add('myaie-jiggle');
@@ -1189,7 +1257,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
             grid.classList.remove('myaie-jiggle');
             card.__drag = false;
             dragging = false;
-            saveOrder(grid);                                         // keeps whatever order is on screen
+            saveOrder(grid); // keeps whatever order is on screen
             if (SORT !== 'custom') { SORT = 'custom'; writeJSON(KEYS.sort, SORT); setTimeout(render, 0); }
         });
         card.addEventListener('dragover', e => {
@@ -1197,7 +1265,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
             if (!dragEl || dragEl === card) return;
             e.preventDefault();
             setMove(e);
-            if (Date.now() < swapUntil) return;                      // let the slide finish before the next swap
+            if (Date.now() < swapUntil) return; // let the slide finish before the next swap
             swapCards(grid, dragEl, card);
         });
     }
@@ -1228,7 +1296,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
         const rank = new Map(custom.map((a, i) => [a, i]));
         const byKey = (key, dir) => [...cards].sort((x, y) => {
             const kx = key(x), ky = key(y);
-            if (kx === null || ky === null) return kx === ky ? rank.get(x) - rank.get(y) : (kx === null ? 1 : -1);   // nothing to compare goes last
+            if (kx === null || ky === null) return kx === ky ? rank.get(x) - rank.get(y) : (kx === null ? 1 : -1); // nothing to compare goes last
             return dir * (kx < ky ? -1 : kx > ky ? 1 : 0) || rank.get(x) - rank.get(y);
         });
         if (SORT === 'alpha' || SORT === 'alphaDesc') {
@@ -1260,12 +1328,12 @@ Fall back to grep or file reads only for what the graph does not model: literal 
     // Keeps the teal header at the original card's height so taller results don't squash it
     function keepHeaderHeight(orig, card, sid) {
         const measured = orig.firstElementChild ? orig.firstElementChild.getBoundingClientRect().height : 0;
-        if (measured >= 60) headerHeights[sid] = measured;           // the originals are hidden after the first render, so remember it
+        if (measured >= 60) headerHeights[sid] = measured; // the originals are hidden after the first render, so remember it
         const h = headerHeights[sid] || 140;
         Object.assign(card.style, { height: 'auto', maxHeight: 'none', overflow: 'visible' });
         const head = card.firstElementChild;
         if (head) Object.assign(head.style, { flex: '0 0 auto', height: h + 'px', minHeight: h + 'px' });
-        const bottom = card.children[1] || card.appendChild(document.createElement('div'));    // the progress area stays
+        const bottom = card.children[1] || card.appendChild(document.createElement('div')); // the progress area stays
         Object.assign(bottom.style, { flex: '0 0 auto', height: 'auto', minHeight: '0' });
         bottom.style.display = SETTINGS.showProgress ? '' : 'none';
     }
@@ -1282,7 +1350,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
     }
 
     function buildCard({ orig, sid, isNext, html }, grid) {
-        const card = orig.cloneNode(true);                           // the real card: header, badge, dates, progress
+        const card = orig.cloneNode(true); // the real card: header, badge, dates, progress
         card.dataset.sid = sid;
         keepHeaderHeight(orig, card, sid);
         if (isNext) Object.assign(card.style, { outline: `3px solid ${rgb(P.teal)}`, outlineOffset: '2px', boxShadow: `0 0 14px ${rgb(P.teal, .55)}` });
@@ -1293,22 +1361,22 @@ Fall back to grep or file reads only for what the graph does not model: literal 
         results.innerHTML = html;
         results.querySelectorAll('button[data-join]').forEach(b => b.addEventListener('click', e => {
             e.preventDefault();
-            e.stopPropagation();                                     // don't trigger the card's own click
+            e.stopPropagation(); // don't trigger the card's own click
             if (!b.disabled) joinClass(b.getAttribute('data-cid'), b);
         }));
         card.appendChild(results);
 
         card.addEventListener('click', e => {
-            if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey || e.button !== 0) return;   // let the browser open it in a new tab or window
+            if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey || e.button !== 0) return; // let the browser open it in a new tab or window
             e.preventDefault();
-            orig.click();                                            // use the site's own navigation
+            orig.click(); // use the site's own navigation
         });
         enableDrag(card, grid, sid);
         return card;
     }
 
     function createGrid(container) {
-        const grid = container.cloneNode(false);                     // keeps the site's own grid styling
+        const grid = container.cloneNode(false); // keeps the site's own grid styling
         grid.classList.remove('moduleCardContainer');
         grid.id = 'myAIE-grid';
         grid.addEventListener('dragover', e => { if (dragging) { e.preventDefault(); setMove(e); } });
@@ -1332,12 +1400,10 @@ Fall back to grep or file reads only for what the graph does not model: literal 
     function headerMarkup(allMarks) {
         const overall = SETTINGS.showPercent
             ? `<span style="font-size:13px;font-weight:600;opacity:.7"> &middot; overall average ${fmtAvg(allMarks)} (unweighted, ${allMarks.length} marked)</span>` : '';
-        const options = SORT_MODES.map(([key, label]) => `<option value="${key}"${key === SORT ? ' selected' : ''}>${esc(label)}</option>`).join('');
         return `<div style="font-size:20px;font-weight:700">My Courses
             ${overall}
             <button id="myAIE-pdf" class="btn btn-primary btn-sm" style="margin-left:10px;vertical-align:middle">Summary<i class="fal fa-download" style="margin-left: 8px;"></i></button>
-            <button id="myAIE-exams" class="btn btn-primary btn-sm" style="margin-left:8px;vertical-align:middle">Exam dates<i class="fal fa-calendar-days" style="margin-left: 8px;"></i></button>
-            <select id="myAIE-sort" class="form-control form-control-sm" aria-label="Sort courses" title="Sort courses" style="display:inline-block;width:auto;margin-left:8px;vertical-align:middle">${options}</select></div>
+            <button id="myAIE-exams" class="btn btn-primary btn-sm" style="margin-left:8px;vertical-align:middle">Exam dates<i class="fal fa-calendar-days" style="margin-left: 8px;"></i></button></div>
             <div style="font-size:12px;opacity:.7">Drag cards to reorder &middot; <a href="#" id="myAIE-reset" style="color:inherit;text-decoration:underline">reset order</a> &middot; ${esc(statusText)}</div>`;
     }
 
@@ -1349,7 +1415,6 @@ Fall back to grep or file reads only for what the graph does not model: literal 
         head.querySelector('#myAIE-reset').onclick = e => { e.preventDefault(); localStorage.removeItem(KEYS.order); render(); };
         head.querySelector('#myAIE-pdf').onclick = e => { e.preventDefault(); openPdfPicker(); };
         head.querySelector('#myAIE-exams').onclick = e => { e.preventDefault(); downloadExamPdf(); };
-        head.querySelector('#myAIE-sort').onchange = e => setSort(e.target.value);
         return head;
     }
 
@@ -1359,7 +1424,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
         const all = container ? getAllCards(container) : [];
         if (!all.length) return;
         rememberCourses(all);
-        const cards = getCards(container);                           // may be empty if every course is hidden in Settings
+        const cards = getCards(container); // may be empty if every course is hidden in Settings
         renderedSig = sigOf(cards);
 
         let host = document.getElementById('myAIE-results');
@@ -1383,7 +1448,7 @@ Fall back to grep or file reads only for what the graph does not model: literal 
         if (!head || headerHtml !== lastHeaderKey) { head = buildHeader(headerHtml); lastHeaderKey = headerHtml; }
         if (!body || gridKey !== lastGridKey) { body = buildBody(container, parts); lastGridKey = gridKey; }
         if (head.parentElement !== host || body.parentElement !== host) host.replaceChildren(head, body);
-        container.style.display = 'none';                            // hide the originals only once the replacement exists
+        container.style.display = 'none'; // hide the originals only once the replacement exists
     }
 
     /* =====================================================================
@@ -1404,8 +1469,8 @@ Fall back to grep or file reads only for what the graph does not model: literal 
 
     let debounce;
     new MutationObserver(() => { clearTimeout(debounce); debounce = setTimeout(tick, 400); })
-        .observe(document, { childList: true, subtree: true });      // `document` exists even before <html> does
-    setInterval(tick, 15000);                                        // keeps classes and countdowns fresh
+        .observe(document, { childList: true, subtree: true }); // `document` exists even before <html> does
+    setInterval(tick, 15000); // keeps classes and countdowns fresh
     setInterval(() => { if (document.getElementById('myAIE-results')) render(); }, 30000);
     document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
 
