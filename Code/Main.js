@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         myAIE Auto Grades (Courses page)
 // @namespace    http://tampermonkey.net/
-// @version      11.5
+// @version      12.5
 // @description  Replaces the course cards with results cards: marks, weightings, today's classes (with Join), custom order, PDFs and settings
 // @match        https://student.myaie.ac/*
 // @run-at       document-start
@@ -32,11 +32,14 @@
 
     const KEYS = { grades: 'myAIE_grades_cache_v9', weights: 'myAIE_weights_v2', order: 'myAIE_order_v1', settings: 'myAIE_settings_v1', courses: 'myAIE_courses_v1', sort: 'myAIE_sort_v1' };
     const DEFAULT_SETTINGS = {
+        showDoneBar: true, // a bar with the percentage of assessments that are done (marked)
+        showMarks: true, // the whole marks box on each card, and the overall average in the heading
         showPercent: true, // marks, averages and the weighted line
         showWeights: true, // the (15%) next to each assessment
         showProgress: true, // the original card's progress bar
         showToday: true, // the box with today's classes and the next class
         showUpNext: true, // the UP NEXT banner and highlight
+        averageMode: 'unweighted', // 'unweighted' or 'weighted': which average the cards, the heading and the average sort use
         hiddenCourses: [], // course ids hidden from the dashboard
         weights: {} // your own weightings: { courseId: { assessmentId: % } }
     };
@@ -69,6 +72,7 @@
     const fetchedAt = { grades: {}, schedule: {} }; // kind -> sid -> time of last fetch
     const headerHeights = {}; // sid -> height of the original card header (only measurable while the originals are visible)
     const emptySids = new Set(); // courses the API says have no assessments
+    const courseHref = {}; // sid -> the course page address (for example /course/10015/subject/86683), taken from the original card
 
     let running = false; // a refresh is in progress
     let statusText = '';
@@ -91,6 +95,7 @@
         const out = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
         const r = raw && typeof raw === 'object' ? raw : {};
         Object.keys(out).forEach(k => { if (typeof out[k] === 'boolean' && typeof r[k] === 'boolean') out[k] = r[k]; });
+        if (r.averageMode === 'weighted' || r.averageMode === 'unweighted') out.averageMode = r.averageMode;
         if (Array.isArray(r.hiddenCourses)) out.hiddenCourses = r.hiddenCourses.map(Number).filter(Boolean);
         if (r.weights && typeof r.weights === 'object') {
             Object.entries(r.weights).forEach(([sid, mine]) => {
@@ -546,24 +551,35 @@
         return h + nextLine(s, true) + '</div>';
     }
 
+    // A bar showing how many of the course's assessments are done (marked and already taken place)
+    function doneBarHtml(d) {
+        const rows = d ? Object.values(d.rows) : [];
+        if (!rows.length) return '';
+        const done = rows.filter(isMarked).length, pct = Math.round(done / rows.length * 100);
+        return `<div style="width:100%;box-sizing:border-box;font-size:12px;margin-top:7px;margin-bottom:10px">
+            <div role="progressbar" aria-label="Assessments done" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}" style="height:8px;border-radius:4px;background:rgba(128,128,128,.25);overflow:hidden"><div style="width:${pct}%;height:100%;background:${rgb(P.green)}"></div></div>
+            <div style="display:flex;justify-content:space-between;margin-top:3px"><b>Assessments done</b><span>${pct}% &middot; ${done}/${rows.length}</span></div></div>`;
+    }
+
     // The marks table. Adds this course's marks to allMarks for the overall average.
     function bodyHtml(sid, d, allMarks) {
         if (!d) return `<div style="font-size:13px;opacity:.7">${emptySids.has(sid) ? 'No assessments yet.' : 'Loading grades...'}</div>`;
-        const { rows, marks, weightOf, weighted } = courseStats(sid, d);
-        const { showPercent, showWeights } = SETTINGS;
-        allMarks.push(...marks);
-        const wLine = showPercent ? weighted.join(' &middot; ') : '';
+        const { rows, marks, weightOf, weighted, weightedAvg } = courseStats(sid, d);
+        const { showPercent, showWeights } = SETTINGS, isWeighted = SETTINGS.averageMode === 'weighted';
+        if (isWeighted) { if (weightedAvg !== null) allMarks.push(weightedAvg); } else allMarks.push(...marks); // the overall average in the heading follows the same mode
+        const wLine = showPercent && !isWeighted ? weighted.join(' &middot; ') : '';
         const columns = showPercent ? 'minmax(0,1fr) 52px 120px' : 'minmax(0,1fr) 120px';
 
-        let h = `<div style="width:100%;font-size:13px"><div style="font-weight:700;margin-bottom:${wLine ? 2 : 6}px">${showPercent ? `Average ${fmtAvg(marks)} &middot; ` : ''}${marks.length}/${rows.length} marked</div>`;
+        let h = `<div style="width:100%;font-size:13px"><div style="font-weight:700;margin-bottom:${wLine ? 2 : 6}px">${isWeighted ? (showPercent ? `Weighted average ${fmtPct(weightedAvg)}` : '') : `${showPercent ? `Average ${fmtAvg(marks)} &middot; ` : ''}${marks.length}/${rows.length} marked`}</div>`;
         if (wLine) h += `<div style="font-size:12px;opacity:.8;margin-bottom:6px">${wLine}</div>`;
         rows.forEach(r => {
             const w = showWeights ? weightOf(r) : null;
             const score = !showPercent ? '' : `<span style="text-align:right;white-space:nowrap">${isScored(r) ? (isFuture(r) ? `<span title="Not counted: this assessment hasn't taken place yet" style="opacity:.5">${esc(r.pct)}%*</span>` : `<b>${esc(r.pct)}%</b>`) : '-'}</span>`;
-            h += `<div style="display:grid;grid-template-columns:${columns};align-items:center;gap:8px;padding:4px 0;border-top:1px solid rgba(128,128,128,.25)">
+            const link = courseHref[sid] && r.id !== undefined ? courseHref[sid] + '/assessment/' + encodeURIComponent(r.id) : ''; // each test opens its own assessment page
+            h += `<${link ? `a data-assess="1" href="${esc(link)}" title="Open this assessment"` : 'div'} style="display:grid;grid-template-columns:${columns};align-items:center;gap:8px;padding:4px 0;border-top:1px solid rgba(128,128,128,.25);${link ? 'color:inherit;text-decoration:none;cursor:pointer;' : ''}">
                 <span title="${esc(r.name)}" style="${ELLIPSIS}">${esc(shortName(r.name))}${w !== null ? ` <span style="opacity:.6">(${r1(w)}%)</span>` : ''}</span>
                 ${score}
-                <span style="text-align:right;min-width:0">${pill(r.result)}</span></div>`;
+                <span style="text-align:right;min-width:0">${pill(r.result)}</span></${link ? 'a' : 'div'}>`;
         });
         if (showPercent && rows.some(r => isScored(r) && isFuture(r))) h += `<div style="font-size:11px;opacity:.7;padding-top:4px">* Not counted: this assessment hasn't taken place yet.</div>`;
         return h + '</div>';
@@ -1041,6 +1057,8 @@
      * using the same classes as the existing "Calendar" setting so it looks native
      * ===================================================================== */
     const TOGGLES = [
+        ['showDoneBar', 'Assessments done bar', 'A bar with the percentage of each course\'s assessments that are marked'],
+        ['showMarks', 'Marks banner', 'The whole marks box on each course card and the overall average in the heading'],
         ['showPercent', 'Percentages', 'Marks, averages and the weighted line'],
         ['showWeights', 'Weightings', 'The weighting (for example 15%) next to each assessment'],
         ['showProgress', 'Course progress', 'The progress bar from the original course card'],
@@ -1105,6 +1123,8 @@
 
     const sortSelect = () => `<select class="form-control selectcontrol" id="myAIE-sort" style="min-width:220px">${SORT_MODES.map(([key, label]) => `<option value="${esc(key)}"${key === SORT ? ' selected' : ''}>${esc(label)}</option>`).join('')}</select>`;
 
+    const averageModeSelect = mode => `<select class="form-control selectcontrol" id="myAIE-avgmode" style="min-width:220px"><option value="unweighted"${mode === 'weighted' ? '' : ' selected'}>Unweighted average</option><option value="weighted"${mode === 'weighted' ? ' selected' : ''}>Weighted average</option></select>`;
+
     function settingsFormHtml(draft, courses, data, wrapClass, saveClass) {
         const display = TOGGLES.map(([key, label, hint]) => settingRow(esc(label), esc(hint), showHideSelect('data-toggle', key, draft[key]))).join('');
         const modules = courses.length
@@ -1114,7 +1134,8 @@
         return `<div class="settings-title" style="margin-top:32px">Course dashboard</div>
             <form id="myAIE-settings-form"><div class="${esc(wrapClass)}">
                 <div class="form-item"><div class="item-label">Display</div>${display}</div>
-                <div class="form-item"><div class="item-label">Course order</div>${settingRow('Sort courses', 'Dragging a card on the dashboard switches this back to My order', sortSelect())}</div>
+                <div class="form-item"><div class="item-label">Course order</div>${settingRow('Sort courses', 'Dragging a card on the dashboard switches this back to My order', sortSelect())}
+                    ${settingRow('Average shown', 'Weighted shows only the weighted mark. The average sort follows this too', averageModeSelect(draft.averageMode))}</div>
                 <div class="form-item"><div class="item-label">Module</div>${modules}</div>
                 <div id="myAIE-mbox"></div>
                 <div class="form-item"><div class="item-label">Reset</div>${settingRow('Restore defaults', 'Clears every dashboard setting, hidden module and your own weightings', '<a href="#" data-reset="1">Reset all</a>')}</div>
@@ -1123,6 +1144,28 @@
                     <button title="Save" type="submit" class="${esc(saveClass)}">Save</button>
                 </div></div>
             </div></form>`;
+    }
+
+    // Colours a Show/Hide menu: the site's primary button blue (the same blue as the Summary and Exam dates buttons) while it says Show,
+    // and the menu's normal look while it says Hide
+    let primaryBlue = null;
+    function paintShowHide(sel) {
+        if (!sel) return;
+        if (!primaryBlue) {
+            const probe = document.createElement('button');
+            probe.className = 'btn btn-primary';
+            probe.style.cssText = 'position:absolute;left:-9999px;visibility:hidden;';
+            document.body.appendChild(probe);
+            const s = getComputedStyle(probe);
+            primaryBlue = { bg: s.backgroundColor, fg: s.color };
+            probe.remove();
+        }
+        if (!sel.dataset.baseBg) { const s = getComputedStyle(sel); sel.dataset.baseBg = s.backgroundColor; sel.dataset.baseFg = s.color; }
+        const shown = sel.value === '1';
+        sel.style.backgroundColor = shown ? primaryBlue.bg : '';
+        sel.style.borderColor = shown ? primaryBlue.bg : '';
+        sel.style.color = shown ? primaryBlue.fg : '';
+        [...sel.options].forEach(o => { o.style.backgroundColor = sel.dataset.baseBg; o.style.color = sel.dataset.baseFg; });   // keep the open list readable
     }
 
     // Adds the section to /settings once the page has rendered (and again if the site redraws it)
@@ -1143,13 +1186,20 @@
         card.appendChild(section);
 
         section.querySelector('#myAIE-sort').addEventListener('change', e => { sortDraft = e.target.value; });
-        section.querySelectorAll('select[data-toggle]').forEach(el => el.addEventListener('change', () => { draft[el.dataset.toggle] = el.value === '1'; }));
+        section.querySelector('#myAIE-avgmode').addEventListener('change', e => { draft.averageMode = e.target.value; });
+        section.querySelectorAll('select[data-toggle]').forEach(el => {
+            paintShowHide(el);
+            el.addEventListener('change', () => { draft[el.dataset.toggle] = el.value === '1'; paintShowHide(el); });
+        });
 
         // The module menu: shows the editor for the chosen module. Edits to every module are kept in `draft` until Save.
         const msel = section.querySelector('#myAIE-msel'), mbox = section.querySelector('#myAIE-mbox');
         const showModule = sid => {
             mbox.innerHTML = moduleEditorHtml(sid, draft, data);
-            mbox.querySelector('select[data-course]').addEventListener('change', e => {
+            const courseSel = mbox.querySelector('select[data-course]');
+            paintShowHide(courseSel);
+            courseSel.addEventListener('change', e => {
+                paintShowHide(courseSel);
                 draft.hiddenCourses = draft.hiddenCourses.filter(s => s !== sid);
                 if (e.target.value === '0') draft.hiddenCourses.push(sid);
             });
@@ -1191,6 +1241,7 @@
      * RENDER: replaces the course cards with result cards
      * ===================================================================== */
     const CSS = [
+        '#myAIE-grid a[data-assess]:hover{background:rgba(128,128,128,.12);}',
         '#myAIE-grid{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:16px!important;}',
         '#myAIE-grid>a{width:auto!important;max-width:none!important;min-width:0!important;margin:0!important;}',
         '@media (max-width:900px){#myAIE-grid{grid-template-columns:1fr!important;}}',
@@ -1274,10 +1325,11 @@
     const courseTitle = a => cleanText(a.getAttribute('title'));
     const isExamRow = r => /exam/i.test(r.type || '') || /exam/i.test(r.name || '');
 
-    // Average of the marks that count, or null if there are none
+    // The average the dashboard is set to use (weighted or unweighted), or null if there is nothing to average
     function courseAvg(sid, data) {
         if (!hasRows(data[sid])) return null;
-        const marks = courseStats(sid, data[sid]).marks;
+        const { marks, weightedAvg } = courseStats(sid, data[sid]);
+        if (SETTINGS.averageMode === 'weighted') return weightedAvg;
         return marks.length ? mean(marks) : null;
     }
 
@@ -1364,6 +1416,7 @@
             e.stopPropagation(); // don't trigger the card's own click
             if (!b.disabled) joinClass(b.getAttribute('data-cid'), b);
         }));
+        results.querySelectorAll('a[data-assess]').forEach(a => a.addEventListener('click', e => e.stopPropagation())); // open the assessment, not the course
         card.appendChild(results);
 
         card.addEventListener('click', e => {
@@ -1398,8 +1451,8 @@
     }
 
     function headerMarkup(allMarks) {
-        const overall = SETTINGS.showPercent
-            ? `<span style="font-size:13px;font-weight:600;opacity:.7"> &middot; overall average ${fmtAvg(allMarks)} (unweighted, ${allMarks.length} marked)</span>` : '';
+        const overall = SETTINGS.showPercent && SETTINGS.showMarks
+            ? `<span style="font-size:13px;font-weight:600;opacity:.7"> &middot; ${SETTINGS.averageMode === 'weighted' ? `overall weighted average ${fmtAvg(allMarks)} (${allMarks.length} ${allMarks.length === 1 ? 'course' : 'courses'})` : `overall average ${fmtAvg(allMarks)} (unweighted, ${allMarks.length} marked)`}</span>` : '';
         return `<div style="font-size:20px;font-weight:700">My Courses
             ${overall}
             <button id="myAIE-pdf" class="btn btn-primary btn-sm" style="margin-left:10px;vertical-align:middle">Summary<i class="fal fa-download" style="margin-left: 8px;"></i></button>
@@ -1437,8 +1490,10 @@
         const data = loadGrades(), best = findNextClass(cards), allMarks = [];
         const parts = sortCards(cards, data).map(orig => {
             const sid = cardSid(orig);
+            const base = (orig.getAttribute('href') || '').split('?')[0].replace(/\/+$/, '');
+            if (/\/course\/\d+\/subject\/\d+$/.test(base)) courseHref[sid] = base;
             const isNext = SETTINGS.showUpNext && !!best && best.sid === sid;
-            const html = (isNext ? upNextHtml(best.n) : '') + examLineHtml(sid, data) + (SETTINGS.showToday ? todayHtml(sid) : '') + bodyHtml(sid, data[sid], allMarks);
+            const html = (SETTINGS.showDoneBar ? doneBarHtml(data[sid]) : '') + (isNext ? upNextHtml(best.n) : '') + examLineHtml(sid, data) + (SETTINGS.showToday ? todayHtml(sid) : '') + (SETTINGS.showMarks ? bodyHtml(sid, data[sid], allMarks) : '');
             return { orig, sid, isNext, html };
         });
         const headerHtml = headerMarkup(allMarks);
